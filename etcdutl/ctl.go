@@ -49,6 +49,8 @@ func init() {
 		etcdutl.NewVersionCommand(),
 		etcdutl.NewCompletionCommand(),
 		etcdutl.NewMigrateCommand(),
+		etcdutl.NewWALCommand(),
+		etcdutl.NewWALRepairAliasCommand(),
 		bboltcmd.NewRootCommand(),
 	)
 }

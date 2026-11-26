@@ -36,6 +36,42 @@ const minSectorSize = 512
 // frameSizeBytes is frame size in bytes, including record size and padding size.
 const frameSizeBytes = 8
 
+var (
+	// ErrZeroRecord marks a zero length frame. Preallocated WAL tails are full
+	// of zero bytes and hit this path.
+	ErrZeroRecord = errors.New("wal: zero record or preallocated zero fill")
+	// ErrInvalidRecordLength marks a frame whose encoded length cannot fit in
+	// the remaining segment or violates frame alignment.
+	ErrInvalidRecordLength = errors.New("wal: invalid record length")
+	// ErrInvalidRecord marks a frame that could not be unmarshalled.
+	ErrInvalidRecord = errors.New("wal: invalid record")
+)
+
+// OffsetError carries the segment offset at which decoding stopped.
+type OffsetError struct {
+	File   string
+	Offset int64
+	Err    error
+}
+
+func (e *OffsetError) Error() string {
+	if e.File == "" {
+		return fmt.Sprintf("at offset %d: %v", e.Offset, e.Err)
+	}
+	return fmt.Sprintf("in file %q at offset %d: %v", e.File, e.Offset, e.Err)
+}
+
+func (e *OffsetError) Unwrap() error { return e.Err }
+
+// ErrorOffset returns the WAL segment offset carried by err, if any.
+func ErrorOffset(err error) (int64, bool) {
+	var offsetErr *OffsetError
+	if errors.As(err, &offsetErr) {
+		return offsetErr.Offset, true
+	}
+	return 0, false
+}
+
 type Decoder interface {
 	Decode(rec *walpb.Record) error
 	LastOffset() int64
@@ -91,26 +127,53 @@ func (d *decoder) decodeRecord(rec *walpb.Record) error {
 	}
 
 	fileBufReader := d.brs[0]
+	fileInfo := fileBufReader.FileInfo()
+	frameStart := d.lastValidOff
 	l, err := readInt64(fileBufReader)
-	if errors.Is(err, io.EOF) || (err == nil && l == 0) {
-		// hit end of file or preallocated space
+	if errors.Is(err, io.EOF) {
+		// Hit the actual end of this file. In a multi-file decode the next
+		// reader continues the WAL.
 		d.brs = d.brs[1:]
 		if len(d.brs) == 0 {
-			return io.EOF
+			return &OffsetError{File: fileInfo.Name(), Offset: frameStart, Err: io.EOF}
 		}
 		d.lastValidOff = 0
 		return d.decodeRecord(rec)
 	}
 	if err != nil {
-		return err
+		return &OffsetError{File: fileInfo.Name(), Offset: frameStart, Err: err}
+	}
+	if l == 0 {
+		// A zero length frame is either the end of logically written data or a
+		// preallocated tail full of zeros. Stop at its first byte and report
+		// that offset instead of treating it as a decodable record.
+		zeroOffset := d.lastValidOff
+		d.brs = d.brs[1:]
+		if len(d.brs) == 0 {
+			return &OffsetError{
+				File:   fileInfo.Name(),
+				Offset: zeroOffset,
+				Err:    fmt.Errorf("%w: %w", ErrZeroRecord, io.EOF),
+			}
+		}
+		d.lastValidOff = 0
+		return d.decodeRecord(rec)
 	}
 
 	recBytes, padBytes := decodeFrameSize(l)
-	// The length of current WAL entry must be less than the remaining file size.
-	maxEntryLimit := fileBufReader.FileInfo().Size() - d.lastValidOff - padBytes
-	if recBytes > maxEntryLimit {
-		return fmt.Errorf("%w: [wal] max entry size limit exceeded when reading %q, recBytes: %d, fileSize(%d) - offset(%d) - padBytes(%d) = entryLimit(%d)",
-			io.ErrUnexpectedEOF, fileBufReader.FileInfo().Name(), recBytes, fileBufReader.FileInfo().Size(), d.lastValidOff, padBytes, maxEntryLimit)
+	frameBytes := frameSizeBytes + recBytes + padBytes
+	fileSize := fileInfo.Size()
+	remainingFrameBytes := fileSize - frameStart
+	// The length field itself must be sane and the complete frame must fit in
+	// the bytes left in this segment. Checking before allocation prevents a
+	// corrupted length from triggering an enormous allocation. Alignment is
+	// not enforced because older WAL fixtures can contain unpadded frames.
+	if recBytes <= 0 || padBytes < 0 ||
+		frameBytes > remainingFrameBytes {
+		limit := fileSize - frameStart - frameSizeBytes - padBytes
+		err := fmt.Errorf("%w: %w: recBytes=%d, padBytes=%d, frameBytes=%d, fileSize=%d, offset=%d, entryLimit=%d",
+			io.ErrUnexpectedEOF, ErrInvalidRecordLength, recBytes, padBytes, frameBytes, fileSize, frameStart, limit)
+		return &OffsetError{File: fileInfo.Name(), Offset: frameStart, Err: err}
 	}
 
 	data := make([]byte, recBytes+padBytes)
@@ -120,13 +183,16 @@ func (d *decoder) decodeRecord(rec *walpb.Record) error {
 		if errors.Is(err, io.EOF) {
 			err = io.ErrUnexpectedEOF
 		}
+		err = &OffsetError{File: fileInfo.Name(), Offset: frameStart, Err: err}
 		return err
 	}
 	if err := proto.Unmarshal(data[:recBytes], rec); err != nil {
 		if d.isTornEntry(data) {
-			return io.ErrUnexpectedEOF
+			err = io.ErrUnexpectedEOF
+		} else {
+			err = fmt.Errorf("%w: %w", ErrInvalidRecord, err)
 		}
-		return err
+		return &OffsetError{File: fileInfo.Name(), Offset: frameStart, Err: err}
 	}
 
 	// skip crc checking if the record type is CrcType
@@ -144,9 +210,17 @@ func (d *decoder) decodeRecord(rec *walpb.Record) error {
 			}
 
 			if d.isTornEntry(data) {
-				return fmt.Errorf("%w: in file '%s' at position: %d", io.ErrUnexpectedEOF, fileBufReader.FileInfo().Name(), d.lastValidOff)
+				return &OffsetError{
+					File:   fileInfo.Name(),
+					Offset: d.lastValidOff,
+					Err:    fmt.Errorf("%w: torn write", io.ErrUnexpectedEOF),
+				}
 			}
-			return fmt.Errorf("%w: in file '%s' at position: %d", err, fileBufReader.FileInfo().Name(), d.lastValidOff)
+			return &OffsetError{
+				File:   fileInfo.Name(),
+				Offset: d.lastValidOff,
+				Err:    fmt.Errorf("%w: checksum validation failed", err),
+			}
 		}
 	}
 	// record decoded as valid; point last valid offset to end of record

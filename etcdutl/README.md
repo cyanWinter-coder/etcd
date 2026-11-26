@@ -35,6 +35,34 @@ To defragment a data directory directly, use the `--data-dir` flag:
 
 DEFRAG returns a zero exit code only if it succeeded in defragmenting all given endpoints.
 
+### WAL VERIFY AND REPAIR [options] \<wal-dir\>
+
+`etcdutl wal verify` decodes every `*.wal` segment independently and reports the offset of zero-filled, truncated, length-invalid, protobuf-invalid, or checksum-invalid records without modifying files.
+
+`etcdutl wal repair` validates every segment and truncates a damaged segment to the end of its last complete, checksum-valid record. Before truncation it copies the original segment to `<segment>.broken`. If truncation or fsync fails, the command automatically restores that copy. Re-running repair on an already repaired directory is a no-op.
+
+Stop the etcd member before running repair. After repair, start etcd normally; the WAL opens from the retained records and new writes continue from the last raft index.
+
+#### Options
+
+- `--dry-run` -- Report what `wal repair` would change without modifying files.
+- `-w json` -- Print the report as JSON instead of the aligned text report.
+
+#### Example
+
+```bash
+# Inspect all segments first
+./etcdutl wal verify /var/lib/etcd/member/wal
+
+# Truncate only the damaged tails and retain *.broken copies
+./etcdutl wal repair /var/lib/etcd/member/wal
+
+# Machine-readable report
+./etcdutl --write-out=json wal repair /var/lib/etcd/member/wal
+```
+
+The hidden flat spelling `etcdutl wal-repair <wal-dir>` is also available for scripts.
+
 ### SNAPSHOT RESTORE [options] \<filename\>
 
 SNAPSHOT RESTORE creates an etcd data directory for an etcd cluster member from a backend database snapshot and a new cluster configuration. Restoring the snapshot into each member for a new cluster configuration will initialize a new etcd cluster preloaded by the snapshot data.

@@ -16,9 +16,7 @@ package etcdserver
 
 import (
 	"encoding/json"
-	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"os"
 	"strings"
@@ -681,8 +679,10 @@ func openWALFromSnapshot(cfg config.ServerConfig, snapshot *raftpb.Snapshot) (*w
 		wmetadata, st, ents, err := w.ReadAll()
 		if err != nil {
 			w.Close()
-			// we can only repair ErrUnexpectedEOF and we never repair twice.
-			if repaired || !errors.Is(err, io.ErrUnexpectedEOF) {
+			// Repair handles torn frames, zero-filled preallocated tails,
+			// malformed lengths/records, and checksum mismatches. It never
+			// runs more than once for one bootstrap attempt.
+			if repaired || !wal.IsRepairableError(err) {
 				cfg.Logger.Fatal("failed to read WAL, cannot be repaired", zap.Error(err))
 			}
 			if !wal.Repair(cfg.Logger, cfg.WALDir()) {

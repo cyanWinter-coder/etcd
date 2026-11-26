@@ -23,6 +23,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	"go.etcd.io/etcd/api/v3/v3rpc/rpctypes"
+	"go.etcd.io/etcd/server/v3/lease"
 	"go.etcd.io/etcd/server/v3/storage/mvcc"
 )
 
@@ -36,6 +37,10 @@ func TestGRPCError(t *testing.T) {
 		{err: context.Canceled, exp: context.Canceled},
 		{err: context.DeadlineExceeded, exp: context.DeadlineExceeded},
 		{err: errors.New("foo"), exp: status.Error(codes.Unknown, "foo")},
+		// Revoked and expired leases are unusable just like missing ones, and
+		// clients already treat lease-not-found as terminal.
+		{err: lease.ErrLeaseRevoked, exp: rpctypes.ErrGRPCLeaseNotFound},
+		{err: lease.ErrLeaseExpired, exp: rpctypes.ErrGRPCLeaseNotFound},
 	}
 	for i := range tt {
 		if err := togRPCError(tt[i].err); !errors.Is(err, tt[i].exp) {

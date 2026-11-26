@@ -71,6 +71,11 @@ var toGRPCErrorMap = map[error]error{
 	lease.ErrLeaseNotFound:    rpctypes.ErrGRPCLeaseNotFound,
 	lease.ErrLeaseExists:      rpctypes.ErrGRPCLeaseExist,
 	lease.ErrLeaseTTLTooLarge: rpctypes.ErrGRPCLeaseTTLTooLarge,
+	// A revoked or expired lease is no longer usable, and clients already
+	// treat "not found" as terminal for keepalive, so both map onto the
+	// existing lease-not-found status rather than surfacing as Unknown.
+	lease.ErrLeaseRevoked: rpctypes.ErrGRPCLeaseNotFound,
+	lease.ErrLeaseExpired: rpctypes.ErrGRPCLeaseNotFound,
 
 	auth.ErrRootUserNotExist:     rpctypes.ErrGRPCRootUserNotExist,
 	auth.ErrRootRoleNotExist:     rpctypes.ErrGRPCRootRoleNotExist,

@@ -134,7 +134,9 @@ func (ls *LeaseServer) leaseKeepAlive(stream pb.Lease_LeaseKeepAliveServer) erro
 		ls.hdr.fill(resp.Header)
 
 		ttl, err := ls.le.LeaseRenew(stream.Context(), lease.LeaseID(req.ID))
-		if errors.Is(err, lease.ErrLeaseNotFound) {
+		if lease.IsLeaseUnusable(err) {
+			// Report a zero TTL so the client stops keepalive and re-creates
+			// the lease, instead of failing the whole stream.
 			err = nil
 			ttl = 0
 		}

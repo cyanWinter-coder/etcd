@@ -112,6 +112,8 @@ func (sl *SimpleLessor) Lookup(id lease.LeaseID) *lease.Lease {
 
 func (sl *SimpleLessor) Leases() []*lease.Lease { return nil }
 
+func (sl *SimpleLessor) LeaseStats() lease.LeaseStats { return lease.LeaseStats{} }
+
 func (sl *SimpleLessor) ExpiredLeasesC() <-chan []*lease.Lease { return nil }
 
 func (sl *SimpleLessor) Recover(b backend.Backend, rd lease.RangeDeleter) {}

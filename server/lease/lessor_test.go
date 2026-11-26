@@ -454,9 +454,10 @@ func TestLessorExpire(t *testing.T) {
 
 	donec := make(chan struct{}, 1)
 	go func() {
-		// expired lease cannot be renewed
-		if _, err := le.Renew(l.ID); !errors.Is(err, ErrLeaseNotFound) {
-			t.Errorf("unexpected renew")
+		// expired lease cannot be renewed; once the revoke completes it is
+		// reported as revoked rather than merely missing
+		if _, err := le.Renew(l.ID); !errors.Is(err, ErrLeaseRevoked) {
+			t.Errorf("unexpected renew: %v", err)
 		}
 		donec <- struct{}{}
 	}()

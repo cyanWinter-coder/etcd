@@ -19,6 +19,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/jonboulle/clockwork"
+
 	"go.etcd.io/etcd/server/v3/lease/leasepb"
 	"go.etcd.io/etcd/server/v3/storage/backend"
 	"go.etcd.io/etcd/server/v3/storage/schema"
@@ -28,6 +30,9 @@ type Lease struct {
 	ID           LeaseID
 	ttl          int64 // time to live of the lease in seconds
 	remainingTTL int64 // remaining time to live in seconds, if zero valued it is considered unset and the full ttl should be used
+	// clock is the lessor clock, which is monotonic even if the wall clock
+	// moves backwards. nil means time.Now is used directly.
+	clock clockwork.Clock
 	// expiryMu protects concurrent accesses to expiry
 	expiryMu sync.RWMutex
 	// expiry is time when lease should expire. no expiration when expiry.IsZero() is true
@@ -37,6 +42,13 @@ type Lease struct {
 	mu      sync.RWMutex
 	itemSet map[LeaseItem]struct{}
 	revokec chan struct{}
+	// revokeOnce makes closing revokec idempotent, so a concurrent duplicate
+	// revoke cannot panic on a double close.
+	revokeOnce sync.Once
+	// revoking is set while a revoke is in flight, so a concurrent duplicate
+	// revoke can be rejected with ErrLeaseRevoked. It is guarded by the
+	// owning lessor's mu.
+	revoking bool
 }
 
 func NewLease(id LeaseID, ttl int64) *Lease {
@@ -80,9 +92,16 @@ func (l *Lease) getRemainingTTL() int64 {
 	return l.ttl
 }
 
+func (l *Lease) now() time.Time {
+	if l.clock == nil {
+		return time.Now()
+	}
+	return l.clock.Now()
+}
+
 // refresh refreshes the expiry of the lease.
 func (l *Lease) refresh(extend time.Duration) {
-	newExpiry := time.Now().Add(extend + time.Duration(l.getRemainingTTL())*time.Second)
+	newExpiry := l.now().Add(extend + time.Duration(l.getRemainingTTL())*time.Second)
 	l.expiryMu.Lock()
 	defer l.expiryMu.Unlock()
 	l.expiry = newExpiry
@@ -116,11 +135,16 @@ func (l *Lease) Keys() []string {
 // Remaining returns the remaining time of the lease.
 func (l *Lease) Remaining() time.Duration {
 	l.expiryMu.RLock()
-	defer l.expiryMu.RUnlock()
-	if l.expiry.IsZero() {
+	expiry := l.expiry
+	l.expiryMu.RUnlock()
+	return l.until(expiry)
+}
+
+func (l *Lease) until(expiry time.Time) time.Duration {
+	if expiry.IsZero() {
 		return time.Duration(math.MaxInt64)
 	}
-	return time.Until(l.expiry)
+	return expiry.Sub(l.now())
 }
 
 type LeaseItem struct {

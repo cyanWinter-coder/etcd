@@ -14,6 +14,12 @@ Previous change logs can be found at [CHANGELOG-3.7](https://github.com/etcd-io/
   - [Cleanup the legacy v2 snapshot source code and cleanup orphaned defragmentation files on bootstrap](https://github.com/etcd-io/etcd/pull/22341)
 - [Add `LeaderId` (`leader_id`) to `ResponseHeader`, including headers for `DefragmentResponse`, `SnapshotResponse`, and `MoveLeaderResponse`](https://github.com/etcd-io/etcd/pull/22327).
 - [Add `NonBlockingDefrag` feature gate to enable non-blocking backend defragmentation](https://github.com/etcd-io/etcd/pull/22425)
+- Lease management robustness:
+  - Leases are granted and renewed into an expiry-ordered queue, and a renew re-queues the lease at its new expiry.
+  - Expired leases are reclaimed in bounded batches, so a clock jump that expires a large set no longer stalls the server.
+  - Lease expiry uses a monotonic clock: a backwards wall clock jump cannot expire or renew a lease early, and large jumps emit a warning.
+  - Repeated operations on a revoked lease return `ErrLeaseRevoked`; operations on an expired lease return `ErrLeaseExpired`; duplicate revokes are rejected instead of racing.
+  - Add `Lessor.LeaseStats` and the `etcd_debugging_lease_active_total` / `etcd_debugging_lease_expiring_total` gauges for the number of active and not-yet-reclaimed leases.
 
 ### Package `clientv3`
 

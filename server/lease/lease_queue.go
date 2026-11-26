@@ -33,6 +33,12 @@ type LeaseQueue []*LeaseWithTime
 func (pq LeaseQueue) Len() int { return len(pq) }
 
 func (pq LeaseQueue) Less(i, j int) bool {
+	if pq[i].time.Equal(pq[j].time) {
+		// Break ties by lease ID so the heap order is deterministic. Without
+		// it, entries with equal expiry can be ordered arbitrarily, which
+		// makes batch contents (and tests) unstable.
+		return pq[i].id < pq[j].id
+	}
 	return pq[i].time.Before(pq[j].time)
 }
 
@@ -90,10 +96,33 @@ func (mq *LeaseExpiredNotifier) RegisterOrUpdate(item *LeaseWithTime) {
 	}
 }
 
+// Update moves an existing item to the given expiry. Unlike RegisterOrUpdate
+// it does not add an item for a lease that is not queued, so a renew can never
+// produce two heap entries for one lease.
+func (mq *LeaseExpiredNotifier) Update(id LeaseID, time time.Time) bool {
+	old, ok := mq.m[id]
+	if !ok {
+		return false
+	}
+	old.time = time
+	heap.Fix(&mq.queue, old.index)
+	return true
+}
+
 func (mq *LeaseExpiredNotifier) Unregister() *LeaseWithTime {
 	item := heap.Pop(&mq.queue).(*LeaseWithTime)
 	delete(mq.m, item.id)
 	return item
+}
+
+// Remove drops the item for the given lease from the queue, if present.
+func (mq *LeaseExpiredNotifier) Remove(id LeaseID) {
+	item, ok := mq.m[id]
+	if !ok {
+		return
+	}
+	heap.Remove(&mq.queue, item.index)
+	delete(mq.m, id)
 }
 
 func (mq *LeaseExpiredNotifier) Peek() *LeaseWithTime {

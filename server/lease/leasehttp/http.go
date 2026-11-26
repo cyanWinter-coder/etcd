@@ -90,8 +90,13 @@ func (h *leaseHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// gofail: var beforeServeHTTPLeaseRenew struct{}
 		ttl, rerr := h.l.Renew(lease.LeaseID(lreq.ID))
 		if rerr != nil {
-			if errors.Is(rerr, lease.ErrLeaseNotFound) {
-				http.Error(w, rerr.Error(), http.StatusNotFound)
+			// A revoked or expired lease is as unusable as a lease that never
+			// existed from the caller's perspective. Collapse the distinctions
+			// into 404 so followers forwarding the renew stop retrying.
+			if errors.Is(rerr, lease.ErrLeaseNotFound) ||
+				errors.Is(rerr, lease.ErrLeaseRevoked) ||
+				errors.Is(rerr, lease.ErrLeaseExpired) {
+				http.Error(w, lease.ErrLeaseNotFound.Error(), http.StatusNotFound)
 				return
 			}
 

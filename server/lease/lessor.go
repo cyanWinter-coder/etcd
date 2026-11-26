@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/Masterminds/semver/v3"
+	"github.com/jonboulle/clockwork"
 	"go.uber.org/zap"
 
 	pb "go.etcd.io/etcd/api/v3/etcdserverpb"
@@ -57,11 +58,41 @@ var (
 	// the default interval to check if the expired lease is revoked
 	defaultExpiredleaseRetryInterval = 3 * time.Second
 
+	// maximum number of expired leases handed to the revoker in a single
+	// batch. Bounds the work the expired-lease channel puts on a follower or
+	// leader in one scheduling round; larger expirations are drained over
+	// subsequent rounds instead of in one burst.
+	defaultMaxExpiredRevokeBatchSize = 1000
+
+	// by how much the wall clock has to jump backwards before the lessor
+	// reports it. Small forward/backward corrections are absorbed by the
+	// monotonic lease clock without noise.
+	defaultLeaseClockRollbackWarnThreshold = 5 * time.Second
+
+	// how many recently revoked lease IDs are remembered to distinguish
+	// repeated operations on a revoked lease from an unknown lease ID.
+	revokedLeaseMemorySize = 1 << 16
+
 	ErrNotPrimary       = errors.New("not a primary lessor")
 	ErrLeaseNotFound    = errors.New("lease not found")
 	ErrLeaseExists      = errors.New("lease already exists")
 	ErrLeaseTTLTooLarge = errors.New("too large lease TTL")
+	// ErrLeaseRevoked is returned when an operation targets a lease that is
+	// already being revoked, or was recently revoked.
+	ErrLeaseRevoked = errors.New("lease already revoked")
+	// ErrLeaseExpired is returned when an operation targets a lease that is
+	// past its expiry but has not been reclaimed yet.
+	ErrLeaseExpired = errors.New("lease already expired")
 )
+
+// IsLeaseUnusable reports whether err means the referenced lease can no longer
+// be used (it was never granted, has been revoked, or has expired). Callers at
+// the API boundary treat all of these as "lease not found".
+func IsLeaseUnusable(err error) bool {
+	return errors.Is(err, ErrLeaseNotFound) ||
+		errors.Is(err, ErrLeaseRevoked) ||
+		errors.Is(err, ErrLeaseExpired)
+}
 
 // TxnDelete is a TxnWrite that only permits deletes. Defined here
 // to avoid circular dependency with mvcc.
@@ -91,8 +122,8 @@ type Lessor interface {
 	// Grant grants a lease that expires at least after TTL seconds.
 	Grant(id LeaseID, ttl int64) (*Lease, error)
 	// Revoke revokes a lease with given ID. The item attached to the
-	// given lease will be removed. If the ID does not exist, an error
-	// will be returned.
+	// given lease will be removed. If the ID does not exist, ErrLeaseNotFound
+	// is returned; if it was already revoked, ErrLeaseRevoked is returned.
 	Revoke(id LeaseID) error
 
 	// Checkpoint applies the remainingTTL of a lease. The remainingTTL is used in Promote to set
@@ -119,8 +150,8 @@ type Lessor interface {
 	// Demote demotes the lessor from being the primary lessor.
 	Demote()
 
-	// Renew renews a lease with given ID. It returns the renewed TTL. If the ID does not exist,
-	// an error will be returned.
+	// Renew renews a lease with given ID. It returns the renewed TTL. If the ID does not
+	// exist, has been revoked, or has expired, an error will be returned.
 	Renew(id LeaseID) (int64, error)
 
 	// Lookup gives the lease at a given lease id, if any
@@ -132,6 +163,11 @@ type Lessor interface {
 	// ExpiredLeasesC returns a chan that is used to receive expired leases.
 	ExpiredLeasesC() <-chan []*Lease
 
+	// LeaseStats returns a point-in-time summary of the managed leases: the
+	// number of live leases, and how many of them are already past their
+	// expiry but not yet reclaimed.
+	LeaseStats() LeaseStats
+
 	// Recover recovers the lessor state from the given backend and RangeDeleter.
 	Recover(b backend.Backend, rd RangeDeleter)
 
@@ -140,8 +176,17 @@ type Lessor interface {
 	Stop()
 }
 
+// LeaseStats summarizes the state of the leases owned by a lessor.
+type LeaseStats struct {
+	// Active is the number of leases currently held by the lessor, including
+	// those that are already past their expiry but not yet reclaimed.
+	Active int
+	// Expiring is the number of leases whose expiry has passed but which have
+	// not been revoked yet. It is a subset of Active.
+	Expiring int
+}
+
 // lessor implements Lessor interface.
-// TODO: use clockwork for testability.
 type lessor struct {
 	mu sync.RWMutex
 
@@ -153,6 +198,14 @@ type lessor struct {
 	leaseExpiredNotifier *LeaseExpiredNotifier
 	leaseCheckpointHeap  LeaseQueue
 	itemMap              map[LeaseItem]LeaseID
+
+	// recentlyRevoked remembers a bounded window of revoked lease IDs, so
+	// repeated operations can return ErrLeaseRevoked rather than "not found".
+	recentlyRevoked *revokedLeases
+
+	// clock is the monotonic lease clock; it never moves backwards even if
+	// the wall clock does. All expiry arithmetic goes through it.
+	clock *leaseClock
 
 	// When a lease expires, the lessor will delete the
 	// leased range (or key) by the RangeDeleter.
@@ -172,6 +225,8 @@ type lessor struct {
 
 	// maximum number of leases to revoke per second
 	leaseRevokeRate int
+	// maximum number of expired leases returned in a single batch
+	maxExpiredRevokeBatchSize int
 
 	expiredC chan []*Lease
 	// stopC is a channel whose closure indicates that the lessor should be stopped.
@@ -203,6 +258,17 @@ type LessorConfig struct {
 	CheckpointPersist          bool
 
 	leaseRevokeRate int
+	// maxExpiredRevokeBatchSize caps how many expired leases are handed to
+	// the revoker per batch. Zero means defaultMaxExpiredRevokeBatchSize.
+	maxExpiredRevokeBatchSize int
+	// clock is the clock used for expiry arithmetic. It may be a fake clock
+	// for tests; nil means the wall clock.
+	clock clockwork.Clock
+	// clockRollbackWarnThreshold is how far the wall clock must jump
+	// backwards before the lessor emits a warning. Zero means
+	// defaultLeaseClockRollbackWarnThreshold; a negative value disables the
+	// warning.
+	clockRollbackWarnThreshold time.Duration
 }
 
 func NewLessor(lg *zap.Logger, b backend.Backend, cluster cluster, cfg LessorConfig) Lessor {
@@ -213,6 +279,7 @@ func newLessor(lg *zap.Logger, b backend.Backend, cluster cluster, cfg LessorCon
 	checkpointInterval := cfg.CheckpointInterval
 	expiredLeaseRetryInterval := cfg.ExpiredLeasesRetryInterval
 	leaseRevokeRate := cfg.leaseRevokeRate
+	maxExpiredRevokeBatchSize := cfg.maxExpiredRevokeBatchSize
 	if checkpointInterval == 0 {
 		checkpointInterval = defaultLeaseCheckpointInterval
 	}
@@ -222,14 +289,33 @@ func newLessor(lg *zap.Logger, b backend.Backend, cluster cluster, cfg LessorCon
 	if leaseRevokeRate == 0 {
 		leaseRevokeRate = defaultLeaseRevokeRate
 	}
+	if maxExpiredRevokeBatchSize <= 0 {
+		maxExpiredRevokeBatchSize = defaultMaxExpiredRevokeBatchSize
+	}
+	clockRollbackWarnThreshold := cfg.clockRollbackWarnThreshold
+	if clockRollbackWarnThreshold == 0 {
+		clockRollbackWarnThreshold = defaultLeaseClockRollbackWarnThreshold
+	}
+	clock := newLeaseClock(cfg.clock, clockRollbackWarnThreshold, func(rollback time.Duration) {
+		if lg != nil {
+			lg.Warn(
+				"wall clock moved backwards; lease expiry is using the last known time until the clock catches up",
+				zap.Duration("rollback", rollback),
+				zap.Duration("warn-threshold", clockRollbackWarnThreshold),
+			)
+		}
+	})
 	l := &lessor{
 		leaseMap:                  make(map[LeaseID]*Lease),
 		itemMap:                   make(map[LeaseItem]LeaseID),
 		leaseExpiredNotifier:      newLeaseExpiredNotifier(),
 		leaseCheckpointHeap:       make(LeaseQueue, 0),
+		recentlyRevoked:           newRevokedLeases(revokedLeaseMemorySize),
+		clock:                     clock,
 		b:                         b,
 		minLeaseTTL:               cfg.MinLeaseTTL,
 		leaseRevokeRate:           leaseRevokeRate,
+		maxExpiredRevokeBatchSize: maxExpiredRevokeBatchSize,
 		checkpointInterval:        checkpointInterval,
 		expiredLeaseRetryInterval: expiredLeaseRetryInterval,
 		checkpointPersist:         cfg.CheckpointPersist,
@@ -262,6 +348,15 @@ func newLessor(lg *zap.Logger, b backend.Backend, cluster cluster, cfg LessorCon
 // Usually this should not be a problem. Lease should not be that sensitive to timing.
 func (le *lessor) isPrimary() bool {
 	return le.demotec != nil
+}
+
+// now returns the current time from the lease clock. A nil clock (as in tests
+// that build a lessor literal by hand) falls back to the wall clock.
+func (le *lessor) now() time.Time {
+	if le.clock == nil {
+		return time.Now()
+	}
+	return le.clock.Now()
 }
 
 func (le *lessor) SetRangeDeleter(rd RangeDeleter) {
@@ -301,6 +396,7 @@ func (le *lessor) Grant(id LeaseID, ttl int64) (*Lease, error) {
 	if l.ttl < le.minLeaseTTL {
 		l.ttl = le.minLeaseTTL
 	}
+	l.clock = le.clock
 
 	if le.isPrimary() {
 		l.refresh(0)
@@ -328,15 +424,33 @@ func (le *lessor) Revoke(id LeaseID) error {
 
 	l := le.leaseMap[id]
 	if l == nil {
+		err := le.leaseUnavailableLocked(id)
 		le.mu.Unlock()
-		return ErrLeaseNotFound
+		return err
 	}
+	if l.revoking {
+		// Another revoke for the same lease is already in flight. Rejecting
+		// the duplicate keeps the external work (and the persistent delete)
+		// from running twice for one lease.
+		le.mu.Unlock()
+		return ErrLeaseRevoked
+	}
+	l.revoking = true
+	// Remove the lease from the expiry queue right away. Otherwise the
+	// revoker could hand it out again while the delete is still in flight.
+	le.leaseExpiredNotifier.Remove(id)
 
-	defer close(l.revokec)
 	// unlock before doing external work
 	le.mu.Unlock()
 
+	// Closing revokec unblocks Renew callers waiting on an expired lease.
+	// revokeOnce makes this safe even if two revokes raced past the check
+	// above (for example with older code paths).
+	l.revokeOnce.Do(func() { close(l.revokec) })
+
 	if le.rd == nil {
+		// No store is attached yet: drop the in-memory lease only.
+		le.finishRevoke(l, false)
 		return nil
 	}
 
@@ -350,18 +464,33 @@ func (le *lessor) Revoke(id LeaseID) error {
 		txn.DeleteRange([]byte(key), nil)
 	}
 
-	le.mu.Lock()
-	defer le.mu.Unlock()
-	delete(le.leaseMap, l.ID)
 	// lease deletion needs to be in the same backend transaction with the
 	// kv deletion. Or we might end up with not executing the revoke or not
-	// deleting the keys if etcdserver fails in between.
-	schema.UnsafeDeleteLease(le.b.BatchTx(), &leasepb.Lease{ID: int64(l.ID)})
+	// deleting the keys if etcdserver fails in between. txn holds the backend
+	// write lock, so the lease bucket write below is safe.
+	le.finishRevoke(l, true)
 
 	txn.End()
 
 	leaseRevoked.Inc()
 	return nil
+}
+
+// finishRevoke removes the lease from the in-memory state, optionally persists
+// the deletion, and records the lease as recently revoked.
+func (le *lessor) finishRevoke(l *Lease, persist bool) {
+	le.mu.Lock()
+	defer le.mu.Unlock()
+
+	if le.leaseMap[l.ID] != l {
+		// Another path already removed it.
+		return
+	}
+	delete(le.leaseMap, l.ID)
+	if persist {
+		schema.UnsafeDeleteLease(le.b.BatchTx(), &leasepb.Lease{ID: int64(l.ID)})
+	}
+	le.recentlyRevoked.add(l.ID)
 }
 
 func (le *lessor) Checkpoint(id LeaseID, remainingTTL int64) error {
@@ -391,8 +520,8 @@ func greaterOrEqual(first, second semver.Version) bool {
 	return !version.LessThan(first, second)
 }
 
-// Renew renews an existing lease. If the given lease does not exist or
-// has expired, an error will be returned.
+// Renew renews an existing lease. If the given lease does not exist, has been
+// revoked, or has expired, an error will be returned.
 func (le *lessor) Renew(id LeaseID) (int64, error) {
 	le.mu.RLock()
 	if !le.isPrimary() {
@@ -405,8 +534,13 @@ func (le *lessor) Renew(id LeaseID) (int64, error) {
 
 	l := le.leaseMap[id]
 	if l == nil {
+		err := le.leaseUnavailableLocked(id)
 		le.mu.RUnlock()
-		return -1, ErrLeaseNotFound
+		return -1, err
+	}
+	if l.revoking {
+		le.mu.RUnlock()
+		return -1, ErrLeaseRevoked
 	}
 	// Clear remaining TTL when we renew if it is set
 	clearRemainingTTL := le.cp != nil && l.remainingTTL > 0
@@ -418,7 +552,7 @@ func (le *lessor) Renew(id LeaseID) (int64, error) {
 		// quorum to be revoked. To be accurate, renew request must wait for the
 		// deletion to complete.
 		case <-l.revokec:
-			return -1, ErrLeaseNotFound
+			return -1, ErrLeaseRevoked
 		// The expired lease might fail to be revoked if the primary changes.
 		// The caller will retry on ErrNotPrimary.
 		case <-demotec:
@@ -443,12 +577,25 @@ func (le *lessor) Renew(id LeaseID) (int64, error) {
 	// Re-check in case the lease was revoked immediately after the previous check
 	l = le.leaseMap[id]
 	if l == nil {
+		err := le.leaseUnavailableLocked(id)
 		le.mu.Unlock()
-		return -1, ErrLeaseNotFound
+		return -1, err
+	}
+	// A lease that expired while the checkpointer was running must not be
+	// revived: the revoker may already be deleting its keys.
+	if l.expired() {
+		le.mu.Unlock()
+		return -1, ErrLeaseExpired
 	}
 	l.refresh(0)
-	item := &LeaseWithTime{id: l.ID, time: l.expiry}
-	le.leaseExpiredNotifier.RegisterOrUpdate(item)
+	// Renew puts the lease back into the expiry queue ordered by its new
+	// expiry, so the soonest-expiring lease stays at the head.
+	if !le.leaseExpiredNotifier.Update(l.ID, l.expiry) {
+		// The lease was not queued (for example it was missed by a prior
+		// queue reset). Register it rather than leave it without an expiry
+		// trigger, which would leak it until the next promote.
+		le.leaseExpiredNotifier.RegisterOrUpdate(&LeaseWithTime{id: l.ID, time: l.expiry})
+	}
 	le.mu.Unlock()
 
 	leaseRenewed.Inc()
@@ -475,6 +622,29 @@ func (le *lessor) Leases() []*Lease {
 	le.mu.RUnlock()
 	sort.Sort(leasesByExpiry(ls))
 	return ls
+}
+
+// LeaseStats reports how many leases are held and how many of them are past
+// their expiry but not yet reclaimed. A non-primary lessor keeps every lease
+// at a forever expiry, so it reports Expiring as zero.
+func (le *lessor) LeaseStats() LeaseStats {
+	le.mu.RLock()
+	defer le.mu.RUnlock()
+	return le.leaseStatsLocked()
+}
+
+// leaseStatsLocked computes the stats assuming le.mu is held.
+func (le *lessor) leaseStatsLocked() LeaseStats {
+	stats := LeaseStats{Active: len(le.leaseMap)}
+	if !le.isPrimary() {
+		return stats
+	}
+	for _, l := range le.leaseMap {
+		if l.expired() {
+			stats.Expiring++
+		}
+	}
+	return stats
 }
 
 func (le *lessor) Promote(extend time.Duration) {
@@ -558,7 +728,10 @@ func (le *lessor) Attach(id LeaseID, items []LeaseItem) error {
 
 	l := le.leaseMap[id]
 	if l == nil {
-		return ErrLeaseNotFound
+		return le.leaseUnavailableLocked(id)
+	}
+	if l.revoking {
+		return ErrLeaseRevoked
 	}
 
 	l.mu.Lock()
@@ -568,6 +741,17 @@ func (le *lessor) Attach(id LeaseID, items []LeaseItem) error {
 	}
 	l.mu.Unlock()
 	return nil
+}
+
+// leaseUnavailableLocked explains why a lease lookup came back empty. A lease
+// that was recently revoked is reported as revoked, so a repeat of an
+// operation that already succeeded fails with ErrLeaseRevoked instead of the
+// misleading ErrLeaseNotFound. The caller must hold le.mu.
+func (le *lessor) leaseUnavailableLocked(id LeaseID) error {
+	if le.recentlyRevoked.contains(id) {
+		return ErrLeaseRevoked
+	}
+	return ErrLeaseNotFound
 }
 
 func (le *lessor) GetLease(item LeaseItem) LeaseID {
@@ -585,7 +769,7 @@ func (le *lessor) Detach(id LeaseID, items []LeaseItem) error {
 
 	l := le.leaseMap[id]
 	if l == nil {
-		return ErrLeaseNotFound
+		return le.leaseUnavailableLocked(id)
 	}
 
 	l.mu.Lock()
@@ -620,6 +804,8 @@ func (le *lessor) Stop() {
 func (le *lessor) runLoop() {
 	defer close(le.doneC)
 
+	// The scan ticker runs on the wall clock: a backwards clock jump must not
+	// stall the loop's ability to revisit the expiry queue.
 	delayTicker := time.NewTicker(500 * time.Millisecond)
 	defer delayTicker.Stop()
 
@@ -640,12 +826,23 @@ func (le *lessor) runLoop() {
 func (le *lessor) revokeExpiredLeases() {
 	var ls []*Lease
 
-	// rate limit
+	// rate limit per round, and cap the batch handed to the revoker so a
+	// clock jump that expires a large set at once is drained over several
+	// rounds instead of in one burst.
 	revokeLimit := le.leaseRevokeRate / 2
+	if revokeLimit > le.maxExpiredRevokeBatchSize {
+		revokeLimit = le.maxExpiredRevokeBatchSize
+	}
+	if revokeLimit <= 0 {
+		revokeLimit = 1
+	}
 
 	le.mu.RLock()
 	if le.isPrimary() {
 		ls = le.findExpiredLeases(revokeLimit)
+		stats := le.leaseStatsLocked()
+		leaseActiveLeases.Set(float64(stats.Active))
+		leaseExpiringLeases.Set(float64(stats.Expiring))
 	}
 	le.mu.RUnlock()
 
@@ -710,7 +907,7 @@ func (le *lessor) expireExists() (l *Lease, next bool) {
 		le.leaseExpiredNotifier.Unregister() // O(log N)
 		return nil, true
 	}
-	now := time.Now()
+	now := le.now()
 	if now.Before(item.time) /* item.time: expiration time */ {
 		// Candidate expirations are caught up, reinsert this item
 		// and no need to revoke (nothing is expiry)
@@ -728,6 +925,14 @@ func (le *lessor) expireExists() (l *Lease, next bool) {
 func (le *lessor) findExpiredLeases(limit int) []*Lease {
 	leases := make([]*Lease, 0, 16)
 
+	// Count the never-expiring queue entries visited in this pass. If the
+	// queue is full of leases that are not (or no longer) expired, the retry
+	// interval rewrites their heap time to now+interval, so only a bounded
+	// number of them can be at the head. This guard keeps the scan from
+	// spinning over the whole map when those entries keep being skipped.
+	skipped := 0
+	maxSkipped := le.leaseExpiredNotifier.Len()
+
 	for {
 		l, next := le.expireExists()
 		if l == nil && !next {
@@ -741,9 +946,14 @@ func (le *lessor) findExpiredLeases(limit int) []*Lease {
 			leases = append(leases, l)
 
 			// reach expired limit
-			if len(leases) == limit {
+			if len(leases) >= limit {
 				break
 			}
+			continue
+		}
+		skipped++
+		if skipped >= maxSkipped {
+			break
 		}
 	}
 
@@ -764,7 +974,7 @@ func (le *lessor) scheduleCheckpointIfNeeded(lease *Lease) {
 		}
 		heap.Push(&le.leaseCheckpointHeap, &LeaseWithTime{
 			id:   lease.ID,
-			time: time.Now().Add(le.checkpointInterval),
+			time: le.now().Add(le.checkpointInterval),
 		})
 	}
 }
@@ -774,7 +984,7 @@ func (le *lessor) findDueScheduledCheckpoints(checkpointLimit int) []*pb.LeaseCh
 		return nil
 	}
 
-	now := time.Now()
+	now := le.now()
 	var cps []*pb.LeaseCheckpoint
 	for le.leaseCheckpointHeap.Len() > 0 && len(cps) < checkpointLimit {
 		lt := le.leaseCheckpointHeap[0]
@@ -826,8 +1036,13 @@ func (le *lessor) initAndRecover() {
 			expiry:       forever,
 			revokec:      make(chan struct{}),
 			remainingTTL: lpb.RemainingTTL,
+			clock:        le.clock,
 		}
 	}
+	// Leases come back from the backend as forever, so they cannot be
+	// revoked or renewed until Promote refreshes their expiries. Start from
+	// a clean revoked set for this incarnation of the lessor.
+	le.recentlyRevoked = newRevokedLeases(revokedLeaseMemorySize)
 	le.leaseExpiredNotifier.Init()
 	heap.Init(&le.leaseCheckpointHeap)
 
@@ -872,6 +1087,8 @@ func (fl *FakeLessor) Lookup(id LeaseID) *Lease {
 }
 
 func (fl *FakeLessor) Leases() []*Lease { return nil }
+
+func (fl *FakeLessor) LeaseStats() LeaseStats { return LeaseStats{} }
 
 func (fl *FakeLessor) ExpiredLeasesC() <-chan []*Lease { return nil }
 

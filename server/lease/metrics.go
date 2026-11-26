@@ -50,6 +50,20 @@ var (
 			Buckets: prometheus.ExponentialBuckets(1, 2, 24),
 		},
 	)
+
+	leaseActiveLeases = prometheus.NewGauge(prometheus.GaugeOpts{
+		Namespace: "etcd_debugging",
+		Subsystem: "lease",
+		Name:      "active_total",
+		Help:      "The current number of leases held by the lessor.",
+	})
+
+	leaseExpiringLeases = prometheus.NewGauge(prometheus.GaugeOpts{
+		Namespace: "etcd_debugging",
+		Subsystem: "lease",
+		Name:      "expiring_total",
+		Help:      "The current number of leases past their expiry that have not been revoked yet.",
+	})
 )
 
 func init() {
@@ -57,4 +71,6 @@ func init() {
 	prometheus.MustRegister(leaseRevoked)
 	prometheus.MustRegister(leaseRenewed)
 	prometheus.MustRegister(leaseTotalTTLs)
+	prometheus.MustRegister(leaseActiveLeases)
+	prometheus.MustRegister(leaseExpiringLeases)
 }
